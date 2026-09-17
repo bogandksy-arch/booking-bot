@@ -24,17 +24,20 @@
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from anthropic import Anthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
@@ -64,6 +67,9 @@ DAYS_AHEAD = 7                   # на скільки днів вперед п�
 TZ = ZoneInfo("Europe/Kyiv")
 DATA_FILE = Path(__file__).parent / "bookings.json"
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+AI_MODEL = "claude-sonnet-4-6"
+ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 UA_WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
 UA_MONTHS = [
@@ -295,6 +301,132 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# AI-запис вільним текстом (працює, якщо задано ANTHROPIC_API_KEY)
+# ---------------------------------------------------------------------------
+
+def build_ai_prompt(user_text: str, now: datetime) -> str:
+    services_list = "\n".join(f"- {name} (код: {key})" for key, name in SERVICES.items())
+    allowed_dates = [
+        (now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(DAYS_AHEAD)
+    ]
+    return (
+        f"Ти — асистент запису клієнтів у «{BUSINESS_NAME}» у Telegram-боті.\n"
+        f"Сьогодні: {now.strftime('%Y-%m-%d')} ({UA_WEEKDAYS[now.weekday()]}), "
+        f"час зараз {now.strftime('%H:%M')}.\n\n"
+        f"Доступні послуги:\n{services_list}\n\n"
+        f"Робочі години: з {WORK_HOURS[0]}:00 до {WORK_HOURS[-1]}:00, "
+        f"запис можливий на дати: {', '.join(allowed_dates)}.\n\n"
+        f'Повідомлення клієнта: "{user_text}"\n\n'
+        "Визнач намір клієнта і поверни ЛИШЕ JSON (без пояснень, без markdown), рівно в такому форматі:\n"
+        '{"service": "код_послуги або null", "date": "YYYY-MM-DD або null", '
+        '"time": "HH:MM або null", '
+        '"reply": "коротка дружня відповідь клієнту українською — якщо чогось не вистачає, постав уточнююче питання"}'
+    )
+
+
+def parse_ai_json(raw_text: str) -> dict | None:
+    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+async def ai_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if ai_client is None:
+        return  # AI-режим вимкнено (нема ANTHROPIC_API_KEY) — ігноруємо вільний текст
+
+    user_text = update.effective_message.text
+    now = datetime.now(TZ)
+
+    try:
+        response = ai_client.messages.create(
+            model=AI_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": build_ai_prompt(user_text, now)}],
+        )
+        raw_text = response.content[0].text
+    except Exception:
+        logger.exception("Помилка звернення до Claude API")
+        await update.effective_message.reply_text(
+            "Вибачте, зараз не можу обробити повідомлення. Спробуйте /book."
+        )
+        return
+
+    parsed = parse_ai_json(raw_text)
+    if not parsed:
+        await update.effective_message.reply_text(
+            "Не зовсім зрозумів. Спробуйте описати інакше або скористайтесь /book."
+        )
+        return
+
+    service_key = parsed.get("service")
+    date_str = parsed.get("date")
+    time_str = parsed.get("time")
+    reply_text = parsed.get("reply") or ""
+
+    has_all_fields = (
+        service_key in SERVICES
+        and date_str
+        and time_str
+        and re.match(r"^\d{2}:\d{2}$", time_str)
+    )
+
+    if not has_all_fields:
+        await update.effective_message.reply_text(reply_text or "Уточніть, будь ласка, деталі запису.")
+        return
+
+    data = load_bookings()
+    if slot_taken(data, date_str, time_str):
+        await update.effective_message.reply_text(
+            f"На жаль, {date_str} о {time_str} вже зайнято. Спробуйте інший час або /book."
+        )
+        return
+
+    user = update.effective_user
+    booking_id = uuid.uuid4().hex[:6]
+    data[booking_id] = {
+        "chat_id": update.effective_chat.id,
+        "user_id": user.id,
+        "user_name": user.full_name,
+        "username": user.username or "",
+        "service": SERVICES[service_key],
+        "date": date_str,
+        "time": time_str,
+        "created_at": now.isoformat(),
+    }
+    save_bookings(data)
+
+    day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=TZ)
+    await update.effective_message.reply_text(
+        f"Готово ✅\n\n"
+        f"Послуга: {SERVICES[service_key]}\n"
+        f"Дата: {fmt_date(day)}\n"
+        f"Час: {time_str}\n"
+        f"id запису: {booking_id}\n\n"
+        f"Щоб скасувати: /cancel {booking_id}"
+    )
+
+    if ADMIN_CHAT_ID:
+        contact = f"@{user.username}" if user.username else user.full_name
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(
+                    f"🆕 Новий запис (через AI-чат)!\n"
+                    f"Клієнт: {contact}\n"
+                    f"Послуга: {SERVICES[service_key]}\n"
+                    f"Дата: {fmt_date(day)}, {time_str}\n"
+                    f"id: {booking_id}"
+                ),
+            )
+        except Exception:
+            logger.exception("Не вдалося надіслати сповіщення адміну")
+
+
+# ---------------------------------------------------------------------------
 # Точка входу
 # ---------------------------------------------------------------------------
 
@@ -318,6 +450,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_service_chosen, pattern=r"^svc:"))
     app.add_handler(CallbackQueryHandler(on_date_chosen, pattern=r"^date:"))
     app.add_handler(CallbackQueryHandler(on_time_chosen, pattern=r"^time:"))
+
+    # Вільний текст у приватних чатах (не команди) — обробляє AI, якщо є ключ
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, ai_handle_message)
+    )
 
     logger.info("Бот запису запущено.")
     app.run_polling()
